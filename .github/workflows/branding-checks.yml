@@ -9,3 +9,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: python3 tests/test_similora_branding.py
       - run: python3 tests/test_release_retention.py
+      - name: Check Android approval decisions with synthetic responses
+        run: |
+          javac -d "$RUNNER_TEMP" android-rebuild/src/org/similora/app/SessionPolicy.java android-rebuild/tests/host/SessionPolicyCheck.java
+          java -cp "$RUNNER_TEMP" org.similora.app.SessionPolicyCheck
