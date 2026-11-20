@@ -17,7 +17,6 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Separate remote account screen and bundled clinical WebView; no remote native bridge. */
 public final class MainActivity extends Activity {
@@ -25,7 +24,8 @@ public final class MainActivity extends Activity {
  static final String LOCAL="https://appassets.androidplatform.net/assets/www/";
  final Handler ui=new Handler(Looper.getMainLooper());
  final ExecutorService network=Executors.newFixedThreadPool(3);
- final AtomicBoolean checking=new AtomicBoolean();
+ boolean checking;
+ long sessionEpoch;
  final ConcurrentHashMap<String,HttpsURLConnection> aiConnections=new ConcurrentHashMap<>();
  final Set<String> cancelled=Collections.synchronizedSet(new HashSet<String>());
  FrameLayout root; StartupScene cover; TextView message; ProgressBar spinner; Button retry,account,updateButton;
@@ -35,14 +35,14 @@ public final class MainActivity extends Activity {
  AppUpdates updates; ValueCallback<Uri[]> chooser;
  String exportId=null,exportText=null,exportName=null,exportUid=null; boolean ready=false;
  final Runnable ticker=new Runnable(){public void run(){if(foreground&&!accountMode)verifySession();if(!destroyed)ui.postDelayed(this,30000);}};
- final BroadcastReceiver lockReceiver=new BroadcastReceiver(){public void onReceive(Context c,Intent i){approved=false;mask("Device locked. Unlock to continue.",false);}};
+ final BroadcastReceiver lockReceiver=new BroadcastReceiver(){public void onReceive(Context c,Intent i){invalidateSessionCheck();mask("Device locked. Unlock to continue.",false);}};
  @Override public void onCreate(Bundle state){
   super.onCreate(state);getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
   root=new FrameLayout(this);root.setFitsSystemWindows(true);root.setBackgroundColor(Color.rgb(8,34,46));setContentView(root);
   cover=new StartupScene(this);
   message=new TextView(this);message.setTextSize(16);message.setTextColor(Color.rgb(233,245,245));message.setGravity(Gravity.CENTER);message.setPadding(0,8,0,8);message.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);cover.controls.addView(message);
   spinner=new ProgressBar(this);cover.controls.addView(spinner,new LinearLayout.LayoutParams(36,36));
-  retry=new Button(this);retry.setText("Try again");retry.setOnClickListener(v->{if(clinical!=null&&!ready&&!accountMode)clinical.reload();verifySession();});cover.controls.addView(retry);
+  retry=new Button(this);retry.setText("Try again");retry.setOnClickListener(v->{if(accountMode){showAccount();return;}if(clinical!=null&&!ready)clinical.reload();verifySession();});cover.controls.addView(retry);
   account=new Button(this);account.setText("Account & access");account.setOnClickListener(v->showAccount());cover.controls.addView(account);
   updateButton=new Button(this);updateButton.setText("App updates");updateButton.setOnClickListener(v->{if(updates!=null&&canUpdate())updates.show();});cover.controls.addView(updateButton);root.addView(cover,new FrameLayout.LayoutParams(-1,-1));
   WebView.setWebContentsDebuggingEnabled(false);CookieManager.getInstance().setAcceptCookie(true);
@@ -51,14 +51,14 @@ public final class MainActivity extends Activity {
   mask("Checking your account…",true);ui.postDelayed(ticker,30000);
  }
  boolean canUpdate(){return foreground&&!destroyed&&!((KeyguardManager)getSystemService(KEYGUARD_SERVICE)).isDeviceLocked();}
- boolean permitted(){return approved&&vault!=null&&SystemClock.elapsedRealtime()<validUntil&&!destroyed;}
+ boolean permitted(){return foreground&&approved&&vault!=null&&SystemClock.elapsedRealtime()<validUntil&&!destroyed;}
  void requireAccess(){if(!permitted())throw new SecurityException("Approved session required");}
  void mask(String text,boolean busy){if(destroyed)return;getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);cover.setVisibility(View.VISIBLE);cover.bringToFront();message.setText(text);cover.afterIntro=null;cover.active(foreground);spinner.setVisibility(busy?View.VISIBLE:View.GONE);retry.setVisibility(busy?View.GONE:View.VISIBLE);account.setVisibility(busy?View.GONE:View.VISIBLE);updateButton.setVisibility(busy?View.GONE:View.VISIBLE);}
  void settings(WebView view){WebSettings s=view.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setAllowFileAccess(false);s.setAllowContentAccess(false);s.setAllowFileAccessFromFileURLs(false);s.setAllowUniversalAccessFromFileURLs(false);s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);s.setMediaPlaybackRequiresUserGesture(true);if(Build.VERSION.SDK_INT>=26)s.setSafeBrowsingEnabled(true);CookieManager.getInstance().setAcceptThirdPartyCookies(view,false);}
  boolean accountUrl(Uri uri){return "https".equals(uri.getScheme())&&Uri.parse(ORIGIN).getHost().equals(uri.getHost())&&(uri.getPort()==-1||uri.getPort()==443)&&uri.getUserInfo()==null;}
  boolean navigateAccount(Uri u){if(!accountUrl(u))return true;if(u.getPath()!=null&&u.getPath().startsWith("/workspace")){accountMode=false;mask("Opening your clinical workspace…",true);verifySession();return true;}return false;}
  void showAccount(){
-  accountMode=true;approved=false;cancelPending();if(updates!=null)updates.pause();
+  accountMode=true;invalidateSessionCheck();cancelPending();if(updates!=null)updates.pause();
   if(auth==null){auth=new WebView(this);settings(auth);root.addView(auth,new FrameLayout.LayoutParams(-1,-1));auth.setWebViewClient(new WebViewClient(){
    @Override public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest r){return navigateAccount(r.getUrl());}
    @Override public boolean shouldOverrideUrlLoading(WebView view,String url){return navigateAccount(Uri.parse(url));}
@@ -70,21 +70,35 @@ public final class MainActivity extends Activity {
   if(clinical!=null)clinical.setVisibility(View.GONE);auth.setVisibility(View.VISIBLE);auth.bringToFront();mask("Opening account & access…",true);accountLoadFailed=false;auth.loadUrl(ORIGIN+"/account?nativeIntro=1");
  }
  void verifySession(){
-  if(destroyed||checking.getAndSet(true))return;
-  KeyguardManager km=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);if(km.isDeviceLocked()){checking.set(false);approved=false;mask("Unlock your phone to continue.",false);return;}
+  if(destroyed || !foreground || accountMode || checking)return;
+  checking=true;
+  final long epoch=sessionEpoch;
+  KeyguardManager km=(KeyguardManager)getSystemService(KEYGUARD_SERVICE);if(km.isDeviceLocked()){checking=false;approved=false;mask("Unlock your phone to continue.",false);return;}
   final String cookies=CookieManager.getInstance().getCookie(ORIGIN+"/");
   network.execute(()->{try{
-   HttpsURLConnection connection=(HttpsURLConnection)new URL(ORIGIN+"/api/session").openConnection();connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(12000);connection.setReadTimeout(12000);connection.setRequestProperty("Accept","application/json");if(cookies!=null)connection.setRequestProperty("Cookie",cookies);
-   JSONObject data;try{int status=connection.getResponseCode();if(status==401||status==403){ui.post(()->{approved=false;showAccount();});return;}if(status!=200)throw new IOException("Session service unavailable");data=new JSONObject(readLimited(connection.getInputStream(),65536));}finally{connection.disconnect();}
-   if(!"approved".equals(data.optString("status"))){ui.post(()->{approved=false;showAccount();});return;}
-   String next=data.getString("id");if(!next.matches("[a-f0-9]{32}"))throw new IOException("Invalid account identity");
+   HttpsURLConnection connection=(HttpsURLConnection)new URL(ORIGIN+"/api/session").openConnection();connection.setUseCaches(false);connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(12000);connection.setReadTimeout(12000);connection.setRequestProperty("Accept","application/json");if(cookies!=null)connection.setRequestProperty("Cookie",cookies);
+   JSONObject data;try{if(!SessionPolicy.hasIdentity(connection)){finishSessionCheck(epoch,()->{approved=false;showAccount();});return;}data=new JSONObject(readLimited(connection.getInputStream(),65536));}finally{connection.disconnect();}
+   if(!SessionPolicy.accepts(data.optString("id"),data.optString("role"),data.optString("status"))){finishSessionCheck(epoch,()->{approved=false;showAccount();});return;}
+   String next=data.getString("id");
    Vault nextVault=next.equals(uid)&&vault!=null?vault:new Vault(this,next);
-   ui.post(()->{if(destroyed||accountMode)return;if(((KeyguardManager)getSystemService(KEYGUARD_SERVICE)).isDeviceLocked()){approved=false;mask("Unlock your phone to continue.",false);return;}boolean changed=!next.equals(uid);if(changed){cancelPending();if(clinical!=null){clinical.removeJavascriptInterface("openrepertorySecure");clinical.removeJavascriptInterface("openrepertoryNative");root.removeView(clinical);clinical.destroy();clinical=null;ready=false;}}
+   finishSessionCheck(epoch,()->{if(destroyed||accountMode)return;if(((KeyguardManager)getSystemService(KEYGUARD_SERVICE)).isDeviceLocked()){approved=false;mask("Unlock your phone to continue.",false);return;}boolean changed=!next.equals(uid);if(changed){cancelPending();if(clinical!=null){clinical.removeJavascriptInterface("openrepertorySecure");clinical.removeJavascriptInterface("openrepertoryNative");root.removeView(clinical);clinical.destroy();clinical=null;ready=false;}}
     uid=next;vault=nextVault;
     if(exportText==null&&vault.healthy())try{String pending=vault.read("similora.pending_export");if(pending!=null){JSONObject draft=new JSONObject(pending);exportName=draft.getString("name");exportText=draft.getString("text");exportUid=uid;}}catch(Exception ignored){}
     approved=true;validUntil=SystemClock.elapsedRealtime()+60000;if(auth!=null)auth.setVisibility(View.GONE);if(clinical==null)createClinical();else clinical.setVisibility(View.VISIBLE);if(ready&&foreground)reveal();
    });
-  }catch(Exception e){ui.post(()->{approved=false;mask("Connection or encrypted storage could not be verified. Your saved records remain on this phone. Try again; do not clear app data.",false);});}finally{checking.set(false);}});
+  }catch(Exception e){finishSessionCheck(epoch,()->{approved=false;mask("Connection or encrypted storage could not be verified. Your saved records remain on this phone. Try again; do not clear app data.",false);});}});
+ }
+ void invalidateSessionCheck(){
+  sessionEpoch++;
+  checking=false;
+  approved=false;
+ }
+ void finishSessionCheck(long epoch,Runnable result){
+  ui.post(()->{
+   if(epoch!=sessionEpoch || destroyed)return;
+   checking=false;
+   if(foreground && !accountMode)result.run();
+  });
  }
  static String readLimited(InputStream in,int limit)throws IOException{try(InputStream input=in;ByteArrayOutputStream out=new ByteArrayOutputStream()){byte[] buffer=new byte[8192];int n;while((n=input.read(buffer))!=-1){if(out.size()+n>limit)throw new IOException("Response too large");out.write(buffer,0,n);}return out.toString("UTF-8");}}
  static WebResourceResponse denied(){return new WebResourceResponse("text/plain","UTF-8",403,"Forbidden",Collections.singletonMap("Cache-Control","no-store"),new ByteArrayInputStream(new byte[0]));}
@@ -150,7 +164,7 @@ public final class MainActivity extends Activity {
  void launchExport(){try{startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE,exportName),91);}catch(Exception e){complete(exportId,null,"Document picker unavailable",uid);cancelPending();}}
  @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==92){if(chooser!=null){chooser.onReceiveValue(result==RESULT_OK&&data!=null?new Uri[]{data.getData()}:null);chooser=null;}return;}if(request==91&&exportId!=null){String id=exportId,owner=exportUid,content=exportText;exportId=null;if(result!=RESULT_OK||data==null){complete(id,null,"Export cancelled; you can resume from Backup & restore",owner);return;}Uri uri=data.getData();network.execute(()->{try{if(!owner.equals(uid))throw new SecurityException();try(OutputStream out=getContentResolver().openOutputStream(uri,"wt")){if(out==null)throw new IOException();out.write(content.getBytes(StandardCharsets.UTF_8));}ui.post(()->{if(owner.equals(exportUid)){try{vault.batch(new JSONObject().put("similora.pending_export",JSONObject.NULL).toString());}catch(Exception ignored){}exportText=null;exportName=null;exportUid=null;}});complete(id,"saved",null,owner);}catch(Exception e){complete(id,null,"File could not be saved. Retry the export.",owner);}});}}
  @Override protected void onResume(){super.onResume();foreground=true;cover.active(true);if(!accountMode){mask("Checking access…",true);verifySession();}else if(auth!=null){auth.onResume();if(!accountLoadFailed&&auth.getProgress()==100)cover.whenFinished(()->{if(foreground&&accountMode&&!accountLoadFailed){cover.setVisibility(View.GONE);auth.bringToFront();}});}if(clinical!=null)clinical.onResume();}
- @Override protected void onPause(){foreground=false;cover.active(false);getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);if(!accountMode)mask("Similora is paused",false);if(updates!=null)updates.pause();CookieManager.getInstance().flush();super.onPause();}
+ @Override protected void onPause(){foreground=false;invalidateSessionCheck();cover.active(false);getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);if(!accountMode)mask("Similora is paused",false);if(updates!=null)updates.pause();CookieManager.getInstance().flush();super.onPause();}
  @Override public void onBackPressed(){if(accountMode){accountMode=false;mask("Returning to your workspace…",true);verifySession();return;}if(clinical!=null&&permitted()){clinical.evaluateJavascript("window.OR&&OR.clinic&&OR.clinic.back?OR.clinic.back():OR.showPage('dashboard')",null);}else super.onBackPressed();}
  @Override protected void onDestroy(){destroyed=true;cover.dispose();approved=false;ui.removeCallbacksAndMessages(null);try{unregisterReceiver(lockReceiver);}catch(Exception ignored){}if(updates!=null)updates.dispose();network.shutdownNow();cancelPending();if(clinical!=null){clinical.removeJavascriptInterface("openrepertorySecure");clinical.removeJavascriptInterface("openrepertoryNative");clinical.destroy();}if(auth!=null)auth.destroy();super.onDestroy();}
 }
